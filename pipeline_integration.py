@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import re
 from PIL import Image
-from fuzzysearch import find_near_matches
 
 def clean_text(text):
     """Normalize text for fuzzy matching by removing special characters and keeping alphanumeric + spaces"""
@@ -30,12 +29,6 @@ def match_qwen_to_ocr(qwen_json, ocr_results):
     """
     Matches Qwen extracted values to PaddleOCR text blocks to recover their bounding boxes.
     """
-    # We use a dummy class to treat exact matches identically to fuzzy matches for the slicing logic
-    class ExactMatch:
-        def __init__(self, start, end):
-            self.start = start
-            self.end = end
-
     # Support flattened single-page testing by wrapping it inside page_1 if needed
     if isinstance(qwen_json, dict) and not any(k.startswith('page_') for k in qwen_json.keys()):
         qwen_json = {"page_1": qwen_json}
@@ -76,17 +69,9 @@ def match_qwen_to_ocr(qwen_json, ocr_results):
                     continue
                 
                 # ========================
-                # CASE 1: OCR chunk is inside Qwen target
+                # CASE 1: Exact matches ONLY to prevent dates/prices from incorrectly cross-matching
                 # ========================
-                tolerance_1 = max(0, int(len(box_text_clean) * 0.15))
-                matches_1 = find_near_matches(box_text_clean, remaining_target, max_l_dist=tolerance_1) if len(box_text_clean) >= 3 else []
-                
-                if not matches_1 and box_text_clean in remaining_target:
-                    idx_pos = remaining_target.find(box_text_clean)
-                    matches_1 = [ExactMatch(idx_pos, idx_pos + len(box_text_clean))]
-
-                if idx not in used_ocr_indices and matches_1:
-                    best_match = matches_1[0]
+                if idx not in used_ocr_indices and box_text_clean in remaining_target:
                     matched_data.append({
                         "Page": page_num,
                         "Key": key,
@@ -96,49 +81,46 @@ def match_qwen_to_ocr(qwen_json, ocr_results):
                         "BBox": ocr_box['bbox']
                     })
                     used_ocr_indices.add(idx)
-                    remaining_target = remaining_target[:best_match.start] + remaining_target[best_match.end:]
+                    remaining_target = remaining_target.replace(box_text_clean, "", 1)
                     continue 
 
                 # ========================
                 # CASE 2: Qwen field is buried inside a massive OCR line
                 # ========================
-                tolerance_2 = max(0, int(len(remaining_target) * 0.15))
-                matches_2 = find_near_matches(remaining_target, box_text_clean, max_l_dist=tolerance_2) if len(remaining_target) >= 4 else []
-                
-                if not matches_2 and remaining_target in box_text_clean and len(remaining_target) >= 4:
-                    idx_pos = box_text_clean.find(remaining_target)
-                    matches_2 = [ExactMatch(idx_pos, idx_pos + len(remaining_target))]
+                if remaining_target in box_text_clean and len(remaining_target) >= 4:
+                    import re as regex_mod
+                    # Find all occurrences of the remaining_target inside the OCR box
+                    start_indices = [m.start() for m in regex_mod.finditer(regex_mod.escape(remaining_target), box_text_clean)]
                     
-                if matches_2:
-                    # Fix Duplicacy: Ensure we don't grab a character range that was already consumed by another key!
+                    valid_start = None
                     consumed_ranges = used_ocr_ranges.get(idx, [])
-                    valid_match = None
-                    for m in matches_2:
+                    
+                    # Ensure we claim an occurrence that wasn't already consumed by another Key!
+                    for start_idx in start_indices:
+                        end_idx = start_idx + len(remaining_target)
                         overlap = False
-                        for rs, re in consumed_ranges:
-                            # Check overlapping ranges algorithm
-                            if max(m.start, rs) < min(m.end, re):
+                        for rs, re_bound in consumed_ranges:
+                            if max(start_idx, rs) < min(end_idx, re_bound):
                                 overlap = True
                                 break
                         if not overlap:
-                            valid_match = m
+                            valid_start = start_idx
                             break
                             
-                    if valid_match is None:
-                        continue # All fuzzy matches in this OCR block were already consumed by other keys!
+                    if valid_start is None:
+                        continue # All occurrences were already consumed!
                         
-                    best_match = valid_match
-                    start_idx = best_match.start
-                    end_idx = best_match.end
+                    best_start = valid_start
+                    best_end = valid_start + len(remaining_target)
                     
                     # Mark this specific chunk of the OCR box as "Consumed"
                     if idx not in used_ocr_ranges:
                         used_ocr_ranges[idx] = []
-                    used_ocr_ranges[idx].append((start_idx, end_idx))
+                    used_ocr_ranges[idx].append((best_start, best_end))
                     
                     # Calculate character position ratios for geometric slicing
-                    start_ratio = start_idx / max(1, len(box_text_clean))
-                    end_ratio = end_idx / max(1, len(box_text_clean))
+                    start_ratio = best_start / max(1, len(box_text_clean))
+                    end_ratio = best_end / max(1, len(box_text_clean))
                     
                     x1, y1 = ocr_box['bbox'][0]
                     x2, y2 = ocr_box['bbox'][1]
@@ -161,7 +143,7 @@ def match_qwen_to_ocr(qwen_json, ocr_results):
                         "Page": page_num,
                         "Key": key,
                         "Qwen_Value": str(qwen_value),
-                        "OCR_Matched_Text": f"{str(qwen_value)} (Fuzzy Sub)",
+                        "OCR_Matched_Text": f"{str(qwen_value)} (Sub)",
                         "Confidence": ocr_box['confidence'],
                         "BBox": sub_bbox
                     })
@@ -239,7 +221,7 @@ def highlight_matches_on_image(document_path, matched_data, output_path):
 
 def export_to_excel(matched_data, excel_output_path="matched_results.xlsx"):
     """
-    Dumps the final matched data, coordinates, and confidences to an Excel file.
+    Dumps the final matched data to an Excel file.
     """
     df = pd.DataFrame(matched_data)
     df.to_excel(excel_output_path, index=False)
@@ -249,10 +231,6 @@ if __name__ == "__main__":
     import os
     print("Integration pipeline loaded successfully.")
     
-    # ==========================================
-    # STANDALONE TESTING SECTION
-    # Change 'test_document_path' to an actual invoice you want to test!
-    # ==========================================
     test_document_path = "/home/rohit.sahu/Qwen_model/samples_nonstandard_data/Document_1.pdf"
     
     if os.path.exists(test_document_path):
@@ -261,29 +239,16 @@ if __name__ == "__main__":
         from qwen_engine import QwenExtractor
         from pdf2image import convert_from_path
         
-        # 1. Init
         ocr_engine = PaddleOCREngine()
         qwen_engine = QwenExtractor()
         
-        # 2. Extract
         ocr_output = ocr_engine.extract_text_with_confidence(test_document_path)
         qwen_output = qwen_engine.extract_data(test_document_path)
         
-        # 3. Match
         matched_results = match_qwen_to_ocr(qwen_output, ocr_output)
         
-        # 4. Prepare base image for highlighting
-        if test_document_path.lower().endswith('.pdf'):
-            pages = convert_from_path(test_document_path)
-            pages[0].convert('RGB').save('temp_base.jpg')
-            base_img = 'temp_base.jpg'
-        else:
-            base_img = test_document_path
-            
-        # 5. Export
-        highlight_matches_on_image(base_img, matched_results, "output.pdf")
+        highlight_matches_on_image(test_document_path, matched_results, "output.pdf")
         export_to_excel(matched_results, "matched_results.xlsx")
         print("\n✅ Standalone run fully complete! Check 'output.pdf' and 'matched_results.xlsx'")
     else:
         print(f"\n⚠️ Could not find test file: {test_document_path}")
-        print("Please update 'test_document_path' in pipeline_integration.py to point to your invoice to run this file directly.")
