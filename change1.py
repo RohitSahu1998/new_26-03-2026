@@ -22,6 +22,7 @@ def flatten_json(y):
                 i += 1
         else:
             out[name[:-1]] = x
+            
     flatten(y)
     return out
 
